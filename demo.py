@@ -13,8 +13,8 @@ def parse_args():
     parser = ArgumentParser(description=("Create Gif for Gaussian Splatting ",
                                             "Image rendering demonstration."))
     parser.add_argument("img_path", type=str, help="Path to image to render.")
-    parser.add_argument("--n_gaussians", default=500, type=int, help="Number of splats.")
-    parser.add_argument("--iters", default = 200, type=int, help="Iterations for training.")
+    parser.add_argument("--n_gaussians", default=50, type=int, help="Number of splats.")
+    parser.add_argument("--iters", default = 1000, type=int, help="Iterations for training.")
     parser.add_argument("--out_path", type=str, default="splat_rendering.gif",
                         help="Path to output gif.")
     return parser.parse_args()
@@ -44,7 +44,7 @@ def main():
 
 if __name__ == "__main__":
     import sys
-    sys.argv += ["../Downloads/gauss.jpg"]  # Example default argument
+    sys.argv += ["./demo/gauss.jpg"]  # Example default argument
     main()
 
 

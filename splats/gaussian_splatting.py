@@ -20,7 +20,7 @@ class GaussianSplats(nn.Module):
         self.centers = nn.Parameter(2*torch.rand(n_gaussians, 2)-1)
         self.covs = nn.Parameter(torch.randn(n_gaussians, 3).abs()) # (a, b, \theta)
         self._colors = nn.Parameter(torch.randn(n_gaussians, n_channels))
-        self._alphas = nn.Parameter(torch.rand(n_gaussians)) # The alpha values for each ellipse
+        self._alphas = nn.Parameter(torch.randn(n_gaussians)) # The alpha values for each ellipse
         self.img_size = None
 
     @property
@@ -53,9 +53,9 @@ class GaussianSplats(nn.Module):
         inv_a = 1/(self.covs[:,2].abs()+1e-7)[:,None,None]
         inv_b = 1/(self.covs[:,1].abs()+1e-7)[:,None,None]
         zz = (rot_xx*inv_a)**2 + (rot_yy*inv_b)**2
-        #gs = torch.exp(-0.5 * zz)#/(2*torch.pi) *inv_a**2*inv_b**2*
+        gs = torch.exp(-0.5 * zz)#/(2*torch.pi) *inv_a**2*inv_b**2*
         # gs = torch.relu(0.5*zz) # trick to avoid propagation of nan
-        gs = (zz<=1).float() # ellipses only for stabiltiy
+        # gs = (zz<=1).float() # ellipses only for stabiltiy
         gs = gs.unsqueeze(1) # prepares for channels wise multiplication
         alphas = self.alphas[:,None,None,None]
         colors = self.colors[:,:,None,None]
