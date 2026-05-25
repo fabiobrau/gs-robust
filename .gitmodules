@@ -1,6 +1,3 @@
-[submodule "Instant-GI"]
-	path = Instant-GI
-	url = https://github.com/whoiszzj/Instant-GI.git
 [submodule "Fast-2DGS"]
 	path = Fast-2DGS
 	url = https://github.com/Aztech-Lab/Fast-2DGS.git
