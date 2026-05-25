@@ -138,6 +138,25 @@ def main() -> None:
         help="max CG iterations per LM step (matrix-free normal equations).",
     )
     p.add_argument("--cg-tol", type=float, default=1e-3)
+    p.add_argument(
+        "--em",
+        action="store_true",
+        help="fit with closed-form EM / weighted k-means (then optional Adam polish).",
+    )
+    p.add_argument(
+        "--em-polish",
+        action="store_true",
+        help="interleave: one EM step + one Adam step per iteration.",
+    )
+    p.add_argument("--em-lambda", type=float, default=1e-4,
+                   help="covariance damping λ added to Σ_k each M-step.")
+    p.add_argument("--em-sigma-min", type=float, default=0.005)
+    p.add_argument("--em-sigma-max", type=float, default=0.5)
+    p.add_argument("--em-reseed-every", type=int, default=5,
+                   help="reseed dead splats every N EM iters (0 disables).")
+    p.add_argument("--polish-iters", type=int, default=0,
+                   help="post-EM Adam polish steps.")
+    p.add_argument("--polish-lr", type=float, default=0.01)
     p.add_argument("--out", type=str, default="demo_out.png")
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
@@ -171,6 +190,26 @@ def main() -> None:
             fixed_opacity=args.fixed_opacity,
             local_render=args.local_render,
         ).to(device)
+    elif args.em:
+        from gaussian_splats_em import GaussianSplatsEM
+
+        model = GaussianSplatsEM(
+            n_gaussians=args.n_gaussians,
+            n_channels=img.shape[0],
+            learn_opacity=args.learn_opacity,
+            fixed_opacity=args.fixed_opacity,
+            local_render=args.local_render,
+        ).to(device)
+    elif args.em_polish:
+        from gaussian_splats_em_polish import GaussianSplatsEMPolish
+
+        model = GaussianSplatsEMPolish(
+            n_gaussians=args.n_gaussians,
+            n_channels=img.shape[0],
+            learn_opacity=args.learn_opacity,
+            fixed_opacity=args.fixed_opacity,
+            local_render=args.local_render,
+        ).to(device)
     else:
         model = GaussianSplats(
             n_gaussians=args.n_gaussians,
@@ -182,7 +221,7 @@ def main() -> None:
     print(
         f"[demo] {args.n_gaussians} gaussians, "
         f"learn_opacity={model.learn_opacity}, "
-        f"fast_init={args.fast_init}, lm={args.lm}, "
+        f"fast_init={args.fast_init}, lm={args.lm}, em={args.em}, "
         f"n_iters={args.n_iters}"
     )
 
@@ -193,6 +232,23 @@ def main() -> None:
             lm_lambda=args.lm_lambda,
             cg_iters=args.cg_iters,
             cg_tol=args.cg_tol,
+        )
+    elif args.em:
+        model.fit(  # pyright: ignore[reportCallIssue]
+            img,
+            n_iters=args.n_iters,
+            sigma_min=args.em_sigma_min,
+            sigma_max=args.em_sigma_max,
+            lam=args.em_lambda,
+            reseed_every=args.em_reseed_every,
+            polish_iters=args.polish_iters,
+            polish_lr=args.polish_lr,
+        )
+    elif args.em_polish:
+        model.fit(  # pyright: ignore[reportCallIssue]
+            img,
+            n_iters=args.n_iters,
+            lr=args.lr,
         )
     else:
         model.fit(img, n_iters=args.n_iters, lr=args.lr)
