@@ -18,6 +18,7 @@ Coordinate conventions used throughout this package:
 """
 from __future__ import annotations
 
+import math
 import sys
 from collections.abc import Generator
 from pathlib import Path
@@ -50,6 +51,8 @@ def cuda_rasterizer_available() -> bool:
     """True if the image-gs CUDA extension was successfully imported."""
     return _cuda_project is not None
 
+
+_LOCAL_N_SIGMA = 3.0  # truncation radius for the local PyTorch rasterizer
 
 # ---------------------------------------------------------------------------
 # Base class
@@ -174,6 +177,64 @@ class GaussianSplats(nn.Module):
         colors = self.colors[:, :, None, None]                   # (G,C,1,1)
         return (w * colors).sum(0) / (w.sum(0) + eps)           # (C,H,W)
 
+    def _rasterize_pytorch_local(self, img_size: tuple[int, int]) -> Tensor:
+        """PyTorch rasterizer that evaluates each Gaussian only within its 3σ bbox.
+
+        Trades the O(G·H·W) memory of the full rasterizer for a Python loop over
+        Gaussians, each touching only a small (pH×pW) patch.  Useful when Gaussians
+        are small relative to the image.
+        """
+        H, W = img_size
+        device, dtype = self.centers.device, self.centers.dtype
+        eps = 1e-7
+
+        x = torch.linspace(-1.0, 1.0, H, device=device, dtype=dtype)
+        y = torch.linspace(-1.0, 1.0, W, device=device, dtype=dtype)
+
+        num = torch.zeros(self.n_channels, H, W, device=device, dtype=dtype)
+        den = torch.zeros(1, H, W, device=device, dtype=dtype)
+
+        # Bounding-box indices are non-differentiable; detach to avoid graph overhead.
+        centers_d = self.centers.detach()
+        covs_d = self.covs.detach()
+
+        for k in range(self.n_gaussians):
+            cx = centers_d[k, 0].item()
+            cy = centers_d[k, 1].item()
+            th = covs_d[k, 0].item()
+            a = abs(covs_d[k, 2].item())
+            b = abs(covs_d[k, 1].item())
+            ct_k = math.cos(th)
+            st_k = math.sin(th)
+
+            # Half-extents of the tight axis-aligned bbox of the n_sigma ellipse.
+            row_ext = _LOCAL_N_SIGMA * math.sqrt((a * ct_k) ** 2 + (b * st_k) ** 2)
+            col_ext = _LOCAL_N_SIGMA * math.sqrt((a * st_k) ** 2 + (b * ct_k) ** 2)
+
+            r0 = max(0, math.floor((cx - row_ext + 1.0) * 0.5 * (H - 1)))
+            r1 = min(H, math.ceil((cx + row_ext + 1.0) * 0.5 * (H - 1)) + 1)
+            c0 = max(0, math.floor((cy - col_ext + 1.0) * 0.5 * (W - 1)))
+            c1 = min(W, math.ceil((cy + col_ext + 1.0) * 0.5 * (W - 1)) + 1)
+            if r0 >= r1 or c0 >= c1:
+                continue
+
+            xx_g, yy_g = torch.meshgrid(x[r0:r1], y[c0:c1], indexing="ij")
+            d_row = xx_g - self.centers[k, 0]
+            d_col = yy_g - self.centers[k, 1]
+            ct_t = self.covs[k, 0].cos()
+            st_t = self.covs[k, 0].sin()
+            rot_x = d_row * ct_t - d_col * st_t
+            rot_y = d_row * st_t + d_col * ct_t
+            inv_a = 1.0 / (self.covs[k, 2].abs() + eps)
+            inv_b = 1.0 / (self.covs[k, 1].abs() + eps)
+            gs = torch.exp(-0.5 * ((rot_x * inv_a) ** 2 + (rot_y * inv_b) ** 2))
+
+            w = self.alphas[k] * gs
+            num[:, r0:r1, c0:c1] = num[:, r0:r1, c0:c1] + self.colors[k, :, None, None] * w
+            den[0, r0:r1, c0:c1] = den[0, r0:r1, c0:c1] + w
+
+        return num / (den + eps)
+
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
@@ -184,6 +245,8 @@ class GaussianSplats(nn.Module):
         assert img_size is not None, "provide img_size or call fit() first"
         if cuda_rasterizer_available() and self.centers.is_cuda:
             return self._rasterize_cuda(img_size)
+        if self.local_render:
+            return self._rasterize_pytorch_local(img_size)
         return self._rasterize_pytorch(img_size)
 
     # ------------------------------------------------------------------
