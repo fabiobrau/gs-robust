@@ -16,13 +16,14 @@ with E-step quantities::
     r(x)   = Î(x) - I(x)                                (residual)
     ρ_k(x) = w_k(x) · rᵀ (c_k - Î(x))                   (signed drive)
 
-This converges much faster than SGD from scratch. After EM plateaus, a short
-Adam polish (delegated to the parent class) cleans up residual coupling that
-the M-step approximations miss.
+Colors are stored as sigmoid logits in ``_colors`` (consistent with the base
+class). The M-step converts optimal [0,1] color values to logits before
+committing them, so ``self.colors = sigmoid(_colors)`` always gives the
+correct blending weights both during and after EM.
 
 Dead splats (``Σ_x w_k(x) ≈ 0``) are reseeded periodically at the
-highest-error pixel. Opacities are left untouched by EM — enable
-``learn_opacity`` and use the polish step if you need them learned.
+highest-error pixel.  After EM plateaus an optional Adam polish (delegated to
+:class:`~splats.base.GaussianSplats`) cleans up residual coupling.
 """
 from __future__ import annotations
 
@@ -33,7 +34,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from gaussian_splats import GaussianSplats
+from .base import GaussianSplats
 
 
 def _sobel_magnitude(img: Tensor) -> Tensor:
@@ -42,8 +43,7 @@ def _sobel_magnitude(img: Tensor) -> Tensor:
     device, dtype = img.device, img.dtype
     kx = torch.tensor(
         [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
-        device=device,
-        dtype=dtype,
+        device=device, dtype=dtype,
     )
     ky = kx.t().contiguous()
     wx = kx.view(1, 1, 3, 3).expand(C, 1, 3, 3)
@@ -54,13 +54,14 @@ def _sobel_magnitude(img: Tensor) -> Tensor:
     return (gx.pow(2) + gy.pow(2)).sqrt().mean(dim=1).squeeze(0)
 
 
-def _eigh_2x2(M: Tensor, var_min: float, var_max: float) -> tuple[Tensor, Tensor, Tensor]:
+def _eigh_2x2(
+    M: Tensor, var_min: float, var_max: float
+) -> tuple[Tensor, Tensor, Tensor]:
     """Closed-form symmetric 2×2 eigendecomposition with eigenvalue clamping.
 
     Returns ``(theta, std_b, std_a)`` in the parent's ``covs`` layout — ``a``
     is the std along the principal eigenvector (cos θ, sin θ) in (row, col)
-    coords, ``b`` along the orthogonal direction. Eigenvalues are clamped to
-    ``[var_min, var_max]`` before being square-rooted.
+    coords, ``b`` along the orthogonal direction.
     """
     M = 0.5 * (M + M.transpose(-1, -2))
     a, b, c = M[:, 0, 0], M[:, 0, 1], M[:, 1, 1]
@@ -81,11 +82,11 @@ def _eigh_2x2(M: Tensor, var_min: float, var_max: float) -> tuple[Tensor, Tensor
 
 
 class GaussianSplatsEM(GaussianSplats):
-    """EM / weighted-k-means fit variant of :class:`GaussianSplats`."""
+    """EM / weighted-k-means fit variant of :class:`~splats.base.GaussianSplats`."""
 
     @torch.no_grad()
     def init_from_image(self, img: Tensor, edge_floor: float = 0.05) -> None:
-        """Saliency-weighted init: centers sampled from a gradient-magnitude PMF."""
+        """Saliency-weighted init: centers sampled from gradient-magnitude PMF."""
         C, H, W = img.shape
         device, dtype = self.centers.device, self.centers.dtype
         sal = _sobel_magnitude(img.to(device=device, dtype=dtype))
@@ -98,9 +99,15 @@ class GaussianSplatsEM(GaussianSplats):
         new_row = rows.to(dtype) * (2.0 / max(H - 1, 1)) - 1.0
         new_col = cols.to(dtype) * (2.0 / max(W - 1, 1)) - 1.0
         self.centers.data = torch.stack([new_row, new_col], dim=1)
-        self._colors.data = (
-            img.to(device=device, dtype=dtype).reshape(C, -1)[:, idx].t().contiguous()
+        # Store logits so that sigmoid(_colors) = pixel color
+        pixel_c = (
+            img.to(device=device, dtype=dtype)
+            .reshape(C, -1)[:, idx]
+            .t()
+            .contiguous()
+            .clamp(1e-6, 1.0 - 1e-6)
         )
+        self._colors.data = pixel_c.logit()
         sigma = float(2.0 / (G ** 0.5))
         self.covs.data = torch.stack(
             [
@@ -127,8 +134,6 @@ class GaussianSplatsEM(GaussianSplats):
         C, H, W = img.shape
 
         # ---------- E-step ----------
-        # Explicit del calls below: peak memory is dominated by ~6+ (G, H, W)
-        # tensors; freeing each one as soon as it's consumed roughly halves it.
         d_row = xx_grid.unsqueeze(0) - self.centers[:, 0, None, None]
         d_col = yy_grid.unsqueeze(0) - self.centers[:, 1, None, None]
         theta = self.covs[:, 0, None, None]
@@ -146,25 +151,25 @@ class GaussianSplatsEM(GaussianSplats):
         w_k = A_k / S                                                       # (G,H,W)
         del A_k
 
-        colors = self._colors                                               # (G,C)
-        # einsum to avoid materializing (G, C, H, W) intermediates.
+        # Use sigmoid colors (consistent with forward())
+        colors = self.colors                                                # (G,C)
         I_hat = torch.einsum("ghw,gc->chw", w_k, colors)                    # (C,H,W)
         r = I_hat - img                                                     # (C,H,W)
 
-        # ρ_k = w_k · (rᵀc_k − rᵀÎ)
         r_dot_ck = torch.einsum("gc,chw->ghw", colors, r)                   # (G,H,W)
         r_dot_I = (r * I_hat).sum(dim=0)                                    # (H,W)
         rho_k = w_k * (r_dot_ck - r_dot_I.unsqueeze(0))                     # (G,H,W)
         del r_dot_ck
 
-        # ---------- M-step: color (uses w_k) ----------
+        # ---------- M-step: color ----------
         w_sum = w_k.sum(dim=(1, 2))                                         # (G,)
         col_num = torch.einsum("ghw,chw->gc", w_k, img)                     # (G,C)
-        new_colors = (col_num / (w_sum.unsqueeze(1) + eps)).clamp(0.0, 1.0)
+        # Optimal colors in [0,1]; store as logits for sigmoid consistency
+        new_colors = (col_num / (w_sum.unsqueeze(1) + eps)).clamp(1e-6, 1.0 - 1e-6)
         del w_k
 
-        # ---------- M-step: position (uses ρ_k) ----------
-        rho_sum = rho_k.sum(dim=(1, 2))                                     # (G,)
+        # ---------- M-step: position ----------
+        rho_sum = rho_k.sum(dim=(1, 2))
         rho_x = (rho_k * xx_grid.unsqueeze(0)).sum(dim=(1, 2))
         rho_y = (rho_k * yy_grid.unsqueeze(0)).sum(dim=(1, 2))
         live = rho_sum.abs() > eps
@@ -173,7 +178,7 @@ class GaussianSplatsEM(GaussianSplats):
         new_mu_y = torch.where(live, rho_y / rho_safe, self.centers[:, 1])
         new_centers = torch.stack([new_mu_x, new_mu_y], dim=1).clamp(-1.0, 1.0)
 
-        # ---------- M-step: covariance (uses ρ_k and the new μ) ----------
+        # ---------- M-step: covariance ----------
         d_row_n = xx_grid.unsqueeze(0) - new_centers[:, 0, None, None]
         d_col_n = yy_grid.unsqueeze(0) - new_centers[:, 1, None, None]
         Mxx = (rho_k * d_row_n.pow(2)).sum(dim=(1, 2))
@@ -185,20 +190,17 @@ class GaussianSplatsEM(GaussianSplats):
         Myy = torch.where(live, Myy / rho_safe, torch.full_like(Myy, var_floor)) + lam
         Mxy = torch.where(live, Mxy / rho_safe, torch.zeros_like(Mxy))
         M = torch.stack(
-            [
-                torch.stack([Mxx, Mxy], dim=-1),
-                torch.stack([Mxy, Myy], dim=-1),
-            ],
+            [torch.stack([Mxx, Mxy], dim=-1), torch.stack([Mxy, Myy], dim=-1)],
             dim=-2,
         )
         new_theta, new_b, new_a = _eigh_2x2(M, var_floor, sigma_max ** 2)
 
         # ---------- Commit ----------
-        self._colors.data.copy_(new_colors)
+        self._colors.data.copy_(new_colors.logit())
         self.centers.data.copy_(new_centers)
         self.covs.data.copy_(torch.stack([new_theta, new_b, new_a], dim=1))
 
-        # ---------- Densification: reseed dead splats ----------
+        # ---------- Reseed dead splats ----------
         if do_reseed:
             dead = w_sum < eps
             n_dead = int(dead.sum().item())
@@ -212,7 +214,8 @@ class GaussianSplatsEM(GaussianSplats):
                 self.covs.data[dead, 0] = 0.0
                 self.covs.data[dead, 1] = 2.0 * sigma_min
                 self.covs.data[dead, 2] = 2.0 * sigma_min
-                self._colors.data[dead] = img.reshape(C, -1)[:, top].t()
+                pixel_c = img.reshape(C, -1)[:, top].t().clamp(1e-6, 1.0 - 1e-6)
+                self._colors.data[dead] = pixel_c.logit()
 
         mse = r.pow(2).mean()
         return I_hat.detach(), mse.detach()
@@ -237,8 +240,8 @@ class GaussianSplatsEM(GaussianSplats):
 
         device, dtype = self.centers.device, self.centers.dtype
         H, W = self.img_size
-        x = torch.linspace(-1, 1, H, device=device, dtype=dtype)
-        y = torch.linspace(-1, 1, W, device=device, dtype=dtype)
+        x = torch.linspace(-1.0, 1.0, H, device=device, dtype=dtype)
+        y = torch.linspace(-1.0, 1.0, W, device=device, dtype=dtype)
         xx_grid, yy_grid = torch.meshgrid(x, y, indexing="ij")
 
         for it in range(n_iters):
@@ -277,7 +280,7 @@ class GaussianSplatsEM(GaussianSplats):
         saliency_init: bool = True,
         verbose: bool = True,
     ) -> None:
-        """Fit the Gaussian parameters to ``img`` with EM (+ optional Adam polish)."""
+        """Fit with closed-form EM (+ optional Adam polish)."""
         for _ in self._fit_iterable(
             img,
             n_iters=n_iters,

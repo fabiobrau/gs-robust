@@ -1,20 +1,19 @@
-"""GaussianSplats with Fast-2DGS network initialization.
+"""GaussianSplats initialized from the Fast-2DGS pretrained networks.
 
-Same API as ``gaussian_splats.GaussianSplats``, but the constructor also takes
-the target image. It runs the Fast-2DGS pretrained networks
-(``HeatmapUNet`` + ``GaussianUNet_Plus``) once to predict initial Gaussian
-positions, colors, scales, and rotations, then fits with the same optimizer
-loop as the base class.
+Same API as :class:`~splats.base.GaussianSplats`, but the constructor also
+takes the target image.  It runs the Fast-2DGS networks (``HeatmapUNet`` +
+``GaussianUNet_Plus``) once to predict initial Gaussian positions, colors,
+scales, and rotations, then fits with Adam (or any parent-class method).
 
 Reference: Wang et al., "Fast 2DGS: Efficient Image Representation with Deep
 Gaussian Prior", arXiv:2512.12774. Weights live in ``Fast-2DGS/weights/``.
 
-Coordinate / parameter conventions used here:
-    * Fast-2DGS: xy in [0, 1]^2 with (x=col_frac, y=row_frac); scale = (sx, sy)
-      in pixel-like units; rot in [0, 2*pi].
-    * Ours: centers in [-1, 1]^2 with (row, col); covs = (theta, b, a) where a
-      is the std-dev along the rotated row-axis and b along the rotated
-      col-axis.
+Coordinate / parameter conventions:
+    Fast-2DGS: xy in [0, 1]² with (x=col_frac, y=row_frac); scale = (sx, sy)
+      in pixel-like units; rot in [0, 2π].
+    Ours: centers in [-1, 1]² with (row, col); covs = (theta, b_std, a_std)
+      where a is the std-dev along the rotated row-axis and b along the
+      rotated col-axis.
 """
 from __future__ import annotations
 
@@ -25,9 +24,9 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from gaussian_splats import GaussianSplats
+from .base import GaussianSplats
 
-_FAST2DGS_DIR = Path(__file__).resolve().parent / "Fast-2DGS"
+_FAST2DGS_DIR = Path(__file__).resolve().parent.parent / "Fast-2DGS"
 
 
 def _ensure_path() -> None:
@@ -38,7 +37,6 @@ def _ensure_path() -> None:
 
 def _load_networks(device: torch.device, plus: bool = True):
     _ensure_path()
-    # Imported lazily so we don't pay the cost when Fast-2DGS isn't used.
     from models.GS_UNet import GaussianUNet, GaussianUNet_Plus, HeatmapUNet  # noqa
 
     heat = HeatmapUNet(base_ch=32)
@@ -72,11 +70,16 @@ def predict_init(
     """Run Fast-2DGS networks on ``image`` and return init params in our format.
 
     Args:
-        image: ``(C, H, W)`` float tensor in ``[0, 1]``.
-        n_gaussians: how many Gaussians to sample (K).
-        device: device to run the networks on.
-        plus: use ``GaussianUNet_Plus`` (also predicts a sub-pixel offset map).
-        sampling: ``"multinomial"`` (default) or ``"topk"``.
+        image:       ``(C, H, W)`` float tensor in ``[0, 1]``.
+        n_gaussians: number of Gaussians to sample (K).
+        device:      device to run the networks on.
+        plus:        use ``GaussianUNet_Plus`` (also predicts a sub-pixel offset map).
+        sampling:    ``"multinomial"`` (default) or ``"topk"``.
+
+    Returns:
+        dict with keys ``centers``, ``covs``, ``colors``, ``alphas`` — all in
+        our coordinate conventions.  ``colors`` are raw [0,1] values (the
+        caller converts to logits before storing in ``_colors``).
     """
     C, H, W = image.shape
     H_pad = _ceil_to_multiple(H, 16)
@@ -88,7 +91,7 @@ def predict_init(
     heat, feat = _load_networks(device, plus=plus)
     batch_K = torch.full((1, 1), float(n_gaussians), device=device)
 
-    heatmap = heat(x, batch_K)  # (1, 1, H_pad, W_pad)
+    heatmap = heat(x, batch_K)
     out = feat(x, batch_K)
     if plus:
         offset_map, scale_map, color_map, rot_map = out
@@ -101,8 +104,6 @@ def predict_init(
     if sampling == "topk":
         _, idx = prob.topk(n_gaussians, dim=1)
     else:
-        # multinomial isn't supported on MPS for large probability vectors —
-        # do it on CPU and move back.
         idx = torch.multinomial(prob.cpu(), num_samples=n_gaussians, replacement=True).to(device)
     idx = idx[0]
     ys = torch.div(idx, W_pad, rounding_mode="floor").long()
@@ -111,25 +112,23 @@ def predict_init(
     x_frac = xs.float() / (W_pad - 1)
     y_frac = ys.float() / (H_pad - 1)
     if offset_map is not None:
-        off = offset_map[0, :, ys, xs]  # (2, K) — (dx, dy)
+        off = offset_map[0, :, ys, xs]  # (2, K)
         x_frac = (x_frac + off[0]).clamp(0, 1)
         y_frac = (y_frac + off[1]).clamp(0, 1)
 
     # (row, col) in [-1, 1]
     centers = torch.stack([2.0 * y_frac - 1.0, 2.0 * x_frac - 1.0], dim=-1)
 
-    colors = color_map[0, :, ys, xs].t().clamp(0.0, 1.0)  # (K, 3)
+    colors = color_map[0, :, ys, xs].t().clamp(0.0, 1.0)  # (K, C) in [0,1]
 
-    # Scales: Fast-2DGS outputs softplus(.) >= 0, interpreted as pixel-ish
-    # widths by their CUDA rasterizer. Convert to our normalized half-span by
-    # dividing by half the relevant side: sigma_norm = scale_px / (side / 2).
+    # Scales: Fast-2DGS outputs pixel-ish widths; convert to normalized stds
     scales = scale_map[0, :, ys, xs].t()  # (K, 2): (sx, sy)
-    b = (scales[:, 0] * 2.0 / W_pad).clamp(min=1e-3)  # along col axis -> our b
-    a = (scales[:, 1] * 2.0 / H_pad).clamp(min=1e-3)  # along row axis -> our a
+    b = (scales[:, 0] * 2.0 / W_pad).clamp(min=1e-3)  # col (x) direction → b
+    a = (scales[:, 1] * 2.0 / H_pad).clamp(min=1e-3)  # row (y) direction → a
 
-    theta = rot_map[0, 0, ys, xs]  # (K,) in [0, 2*pi]
+    theta = rot_map[0, 0, ys, xs]  # (K,) in [0, 2π]
 
-    covs = torch.stack([theta, b, a], dim=-1)  # (K, 3) = (theta, b, a)
+    covs = torch.stack([theta, b, a], dim=-1)  # (K, 3)
     alphas = torch.ones(n_gaussians, device=device)
     return {"centers": centers, "covs": covs, "colors": colors, "alphas": alphas}
 
@@ -169,9 +168,11 @@ class FastInitGaussianSplats(GaussianSplats):
         with torch.no_grad():
             self.centers.copy_(init["centers"])
             self.covs.copy_(init["covs"])
-            self._colors.copy_(init["colors"])
+            # Store logits so that sigmoid(_colors) = network-predicted color
+            self._colors.copy_(init["colors"].clamp(1e-6, 1.0 - 1e-6).logit())
             if self.learn_opacity:
-                self._alphas.copy_(init["alphas"])
-            else:
-                self._alphas.copy_(init["alphas"])
+                # init["alphas"] are target opacities in [0,1]; store as logits
+                self._alphas.copy_(  # type: ignore[union-attr]
+                    init["alphas"].clamp(1e-6, 1.0 - 1e-6).logit()
+                )
         self.img_size = tuple(image.shape[1:])

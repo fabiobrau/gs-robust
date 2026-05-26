@@ -1,3 +1,6 @@
 [submodule "Fast-2DGS"]
 	path = Fast-2DGS
 	url = https://github.com/Aztech-Lab/Fast-2DGS.git
+[submodule "image-gs"]
+	path = image-gs
+	url = https://github.com/NYU-ICL/image-gs.git

@@ -5,11 +5,17 @@ if no image is supplied) and saves a three-panel figure:
 
     clean (left)  |  rasterized (center)  |  2-sigma ellipses (right)
 
+Three fitting modes are available:
+    default     — naive Adam optimisation (``GaussianSplats``).
+    --fast-init — initialize with Fast-2DGS pretrained networks, then Adam.
+    --em        — closed-form EM / weighted k-means (+ optional Adam polish).
+
 Examples
 --------
-    python demo.py
-    python demo.py data/gauss.jpeg --n-gaussians 1500 --n-iters 300
-    python demo.py --learn-opacity         # make per-gaussian alpha learnable
+    python3 demo.py
+    python3 demo.py data/gauss.jpeg --n-gaussians 1500 --n-iters 300
+    python3 demo.py --em --em-polish-iters 50
+    python3 demo.py --fast-init --n-gaussians 600
 """
 
 from __future__ import annotations
@@ -21,9 +27,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torchvision.transforms.functional as tf
-from gaussian_splats import GaussianSplats
 from matplotlib.collections import LineCollection
 from PIL import Image
+
+from splats import GaussianSplats, GaussianSplatsEM, FastInitGaussianSplats
+from splats import cuda_rasterizer_available
 
 
 def pick_device() -> torch.device:
@@ -35,7 +43,7 @@ def pick_device() -> torch.device:
 
 
 def synthetic_image(size: int = 128) -> torch.Tensor:
-    """A simple synthetic RGB image so the demo runs without external files."""
+    """Simple synthetic RGB image so the demo runs without external files."""
     y, x = torch.meshgrid(
         torch.linspace(-1, 1, size),
         torch.linspace(-1, 1, size),
@@ -43,13 +51,12 @@ def synthetic_image(size: int = 128) -> torch.Tensor:
     )
     r = (x - 0.25) ** 2 + (y - 0.1) ** 2
     g = (x + 0.3) ** 2 + (y + 0.2) ** 2
-    b = x**2 + (y - 0.4) ** 2
+    b = x ** 2 + (y - 0.4) ** 2
     img = torch.stack([
         torch.exp(-6 * r),
         torch.exp(-6 * g),
         torch.exp(-6 * b),
     ])
-    # add a checker-ish background to give the splats something more textured
     checker = ((x * 4).floor() + (y * 4).floor()).remainder(2)
     img = 0.7 * img + 0.3 * checker.unsqueeze(0)
     return img.clamp(0, 1)
@@ -74,17 +81,13 @@ def plot_ellipses(ax, model: GaussianSplats, img_size: tuple[int, int]) -> None:
     """Draw empty 2-sigma ellipses on ``ax`` in pixel coordinates."""
     H, W = img_size
     contours = model.ellipse_contours(n_sigma=2.0, n_points=64).to("cpu").numpy()
-    # contours[..., 0] is the row coord (dim 0), contours[..., 1] the col coord.
-    # map normalized [-1, 1] -> pixel coords for imshow:
-    #   matplotlib x-axis = column = contours[..., 1]
-    #   matplotlib y-axis = row    = contours[..., 0]
     px = (contours[..., 1] + 1.0) * 0.5 * (W - 1)
     py = (contours[..., 0] + 1.0) * 0.5 * (H - 1)
-    segs = np.stack([px, py], axis=-1)  # (G, P, 2)
+    segs = np.stack([px, py], axis=-1)
     lc = LineCollection(segs, colors="black", linewidths=0.4, alpha=0.7)
     ax.add_collection(lc)
     ax.set_xlim(-0.5, W - 0.5)
-    ax.set_ylim(H - 0.5, -0.5)  # invert y to match imshow
+    ax.set_ylim(H - 0.5, -0.5)
     ax.set_aspect("equal")
     ax.set_facecolor("white")
 
@@ -92,86 +95,60 @@ def plot_ellipses(ax, model: GaussianSplats, img_size: tuple[int, int]) -> None:
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
-        "image",
-        type=str,
-        nargs="?",
-        default=None,
+        "image", type=str, nargs="?", default=None,
         help="path to input image (omit for synthetic test pattern)",
     )
     p.add_argument(
-        "--size",
-        type=int,
-        default=None,
-        help="resize input to size x size; default keeps the image's native dims",
+        "--size", type=int, default=None,
+        help="resize input to size×size; default keeps the image's native dims",
     )
     p.add_argument("--n-gaussians", type=int, default=600)
     p.add_argument("--n-iters", type=int, default=300)
     p.add_argument("--lr", type=float, default=0.05)
     p.add_argument(
-        "--learn-opacity",
-        action="store_true",
+        "--learn-opacity", action="store_true",
         help="make per-gaussian alpha learnable (default: frozen at --fixed-opacity).",
     )
     p.add_argument("--fixed-opacity", type=float, default=1.0)
     p.add_argument(
-        "--local-render",
-        action="store_true",
-        help="evaluate each gaussian only on its 3-sigma AABB (faster on CUDA "
-        "and at small G; usually slower on MPS for G > ~1000).",
+        "--local-render", action="store_true",
+        help="hint: tile-based CUDA rasterizer handles this natively.",
     )
     p.add_argument(
-        "--fast-init",
-        action="store_true",
-        help="initialize Gaussians with Fast-2DGS pretrained networks "
-        "(submodule under Fast-2DGS/).",
+        "--fast-init", action="store_true",
+        help="initialize Gaussians with Fast-2DGS pretrained networks (Fast-2DGS submodule).",
     )
     p.add_argument(
-        "--lm",
-        action="store_true",
-        help="fit with Levenberg-Marquardt instead of Adam (uses --lm-lambda).",
-    )
-    p.add_argument("--lm-lambda", type=float, default=1e-3)
-    p.add_argument(
-        "--cg-iters",
-        type=int,
-        default=30,
-        help="max CG iterations per LM step (matrix-free normal equations).",
-    )
-    p.add_argument("--cg-tol", type=float, default=1e-3)
-    p.add_argument(
-        "--em",
-        action="store_true",
+        "--em", action="store_true",
         help="fit with closed-form EM / weighted k-means (then optional Adam polish).",
     )
     p.add_argument(
-        "--em-polish",
-        action="store_true",
-        help="interleave: one EM step + one Adam step per iteration.",
+        "--em-lambda", type=float, default=1e-4,
+        help="covariance damping λ added to Σ_k each M-step.",
     )
-    p.add_argument("--em-lambda", type=float, default=1e-4,
-                   help="covariance damping λ added to Σ_k each M-step.")
     p.add_argument("--em-sigma-min", type=float, default=0.005)
     p.add_argument("--em-sigma-max", type=float, default=0.5)
-    p.add_argument("--em-reseed-every", type=int, default=5,
-                   help="reseed dead splats every N EM iters (0 disables).")
-    p.add_argument("--polish-iters", type=int, default=0,
+    p.add_argument(
+        "--em-reseed-every", type=int, default=5,
+        help="reseed dead splats every N EM iters (0 disables).",
+    )
+    p.add_argument("--em-polish-iters", type=int, default=0,
                    help="post-EM Adam polish steps.")
-    p.add_argument("--polish-lr", type=float, default=0.01)
+    p.add_argument("--em-polish-lr", type=float, default=0.01)
     p.add_argument("--out", type=str, default="demo_out.png")
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
     device = pick_device()
-    print(f"[demo] device = {device}")
+    cuda_ok = cuda_rasterizer_available()
+    print(f"[demo] device = {device}  |  CUDA rasterizer = {cuda_ok}")
 
     img = load_image(args.image, args.size).to(device)
     H, W = img.shape[1:]
-    print(f"[demo] image size = {H}x{W}")
+    print(f"[demo] image size = {H}×{W}")
 
     if args.fast_init:
-        from gaussian_splats_fast2dgs import FastInitGaussianSplats
-
         model = FastInitGaussianSplats(
             image=img,
             n_gaussians=args.n_gaussians,
@@ -180,30 +157,8 @@ def main() -> None:
             fixed_opacity=args.fixed_opacity,
             local_render=args.local_render,
         ).to(device)
-    elif args.lm:
-        from gaussian_splats_lm import GaussianSplatsLM
-
-        model = GaussianSplatsLM(
-            n_gaussians=args.n_gaussians,
-            n_channels=img.shape[0],
-            learn_opacity=args.learn_opacity,
-            fixed_opacity=args.fixed_opacity,
-            local_render=args.local_render,
-        ).to(device)
     elif args.em:
-        from gaussian_splats_em import GaussianSplatsEM
-
         model = GaussianSplatsEM(
-            n_gaussians=args.n_gaussians,
-            n_channels=img.shape[0],
-            learn_opacity=args.learn_opacity,
-            fixed_opacity=args.fixed_opacity,
-            local_render=args.local_render,
-        ).to(device)
-    elif args.em_polish:
-        from gaussian_splats_em_polish import GaussianSplatsEMPolish
-
-        model = GaussianSplatsEMPolish(
             n_gaussians=args.n_gaussians,
             n_channels=img.shape[0],
             learn_opacity=args.learn_opacity,
@@ -218,37 +173,24 @@ def main() -> None:
             fixed_opacity=args.fixed_opacity,
             local_render=args.local_render,
         ).to(device)
+
     print(
-        f"[demo] {args.n_gaussians} gaussians, "
-        f"learn_opacity={model.learn_opacity}, "
-        f"fast_init={args.fast_init}, lm={args.lm}, em={args.em}, "
+        f"[demo] {args.n_gaussians} gaussians | "
+        f"learn_opacity={model.learn_opacity} | "
+        f"fast_init={args.fast_init} | em={args.em} | "
         f"n_iters={args.n_iters}"
     )
 
-    if args.lm:
-        model.fit(
-            img,
-            n_iters=args.n_iters,
-            lm_lambda=args.lm_lambda,
-            cg_iters=args.cg_iters,
-            cg_tol=args.cg_tol,
-        )
-    elif args.em:
-        model.fit(  # pyright: ignore[reportCallIssue]
+    if args.em:
+        model.fit(  # type: ignore[union-attr]
             img,
             n_iters=args.n_iters,
             sigma_min=args.em_sigma_min,
             sigma_max=args.em_sigma_max,
             lam=args.em_lambda,
             reseed_every=args.em_reseed_every,
-            polish_iters=args.polish_iters,
-            polish_lr=args.polish_lr,
-        )
-    elif args.em_polish:
-        model.fit(  # pyright: ignore[reportCallIssue]
-            img,
-            n_iters=args.n_iters,
-            lr=args.lr,
+            polish_iters=args.em_polish_iters,
+            polish_lr=args.em_polish_lr,
         )
     else:
         model.fit(img, n_iters=args.n_iters, lr=args.lr)
@@ -271,7 +213,7 @@ def main() -> None:
         ax.set_yticks([])
     fig.tight_layout()
     fig.savefig(args.out, dpi=150)
-    print(f"[demo] saved figure -> {args.out}")
+    print(f"[demo] saved figure → {args.out}")
 
 
 if __name__ == "__main__":
