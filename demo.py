@@ -29,9 +29,12 @@ import torch
 import torchvision.transforms.functional as tf
 from matplotlib.collections import LineCollection
 from PIL import Image
-
-from splats import GaussianSplats, GaussianSplatsEM, FastInitGaussianSplats
-from splats import cuda_rasterizer_available
+from splats import (
+    FastInitGaussianSplats,
+    GaussianSplats,
+    GaussianSplatsEM,
+    cuda_rasterizer_available,
+)
 
 
 def pick_device() -> torch.device:
@@ -51,7 +54,7 @@ def synthetic_image(size: int = 128) -> torch.Tensor:
     )
     r = (x - 0.25) ** 2 + (y - 0.1) ** 2
     g = (x + 0.3) ** 2 + (y + 0.2) ** 2
-    b = x ** 2 + (y - 0.4) ** 2
+    b = x**2 + (y - 0.4) ** 2
     img = torch.stack([
         torch.exp(-6 * r),
         torch.exp(-6 * g),
@@ -80,7 +83,9 @@ def tensor_to_np(img: torch.Tensor) -> np.ndarray:
 def plot_ellipses(ax, model: GaussianSplats, img_size: tuple[int, int]) -> None:
     """Draw empty 2-sigma ellipses on ``ax`` in pixel coordinates."""
     H, W = img_size
-    contours = model.ellipse_contours(n_sigma=2.0, n_points=64).to("cpu").numpy()
+    contours = (
+        model.ellipse_contours(n_sigma=2.0, n_points=64).detach().to("cpu").numpy()
+    )
     px = (contours[..., 1] + 1.0) * 0.5 * (W - 1)
     py = (contours[..., 0] + 1.0) * 0.5 * (H - 1)
     segs = np.stack([px, py], axis=-1)
@@ -95,45 +100,59 @@ def plot_ellipses(ax, model: GaussianSplats, img_size: tuple[int, int]) -> None:
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
-        "image", type=str, nargs="?", default=None,
+        "image",
+        type=str,
+        nargs="?",
+        default=None,
         help="path to input image (omit for synthetic test pattern)",
     )
     p.add_argument(
-        "--size", type=int, default=None,
+        "--size",
+        type=int,
+        default=None,
         help="resize input to size×size; default keeps the image's native dims",
     )
     p.add_argument("--n-gaussians", type=int, default=600)
-    p.add_argument("--n-iters", type=int, default=300)
+    p.add_argument("--n-iters", type=int, default=10)
     p.add_argument("--lr", type=float, default=0.05)
     p.add_argument(
-        "--learn-opacity", action="store_true",
+        "--learn-opacity",
+        action="store_true",
         help="make per-gaussian alpha learnable (default: frozen at --fixed-opacity).",
     )
     p.add_argument("--fixed-opacity", type=float, default=1.0)
     p.add_argument(
-        "--local-render", action="store_true",
+        "--local-render",
+        action="store_true",
         help="hint: tile-based CUDA rasterizer handles this natively.",
     )
     p.add_argument(
-        "--fast-init", action="store_true",
+        "--fast-init",
+        action="store_true",
         help="initialize Gaussians with Fast-2DGS pretrained networks (Fast-2DGS submodule).",
     )
     p.add_argument(
-        "--em", action="store_true",
+        "--em",
+        action="store_true",
         help="fit with closed-form EM / weighted k-means (then optional Adam polish).",
     )
     p.add_argument(
-        "--em-lambda", type=float, default=1e-4,
+        "--em-lambda",
+        type=float,
+        default=1e-4,
         help="covariance damping λ added to Σ_k each M-step.",
     )
     p.add_argument("--em-sigma-min", type=float, default=0.005)
     p.add_argument("--em-sigma-max", type=float, default=0.5)
     p.add_argument(
-        "--em-reseed-every", type=int, default=5,
+        "--em-reseed-every",
+        type=int,
+        default=5,
         help="reseed dead splats every N EM iters (0 disables).",
     )
-    p.add_argument("--em-polish-iters", type=int, default=0,
-                   help="post-EM Adam polish steps.")
+    p.add_argument(
+        "--em-polish-iters", type=int, default=200, help="post-EM Adam polish steps."
+    )
     p.add_argument("--em-polish-lr", type=float, default=0.01)
     p.add_argument("--out", type=str, default="demo_out.png")
     p.add_argument("--seed", type=int, default=0)
