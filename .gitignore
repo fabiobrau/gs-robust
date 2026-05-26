@@ -6,3 +6,4 @@ demo_out.gif
 *.pth
 *.pth.tar
 .vscode/
+.claude/
