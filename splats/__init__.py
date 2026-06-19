@@ -21,6 +21,7 @@ from .online import GaussianSplatsOnline
 from .additive import GaussianSplatsAdditive
 from .varpro import GaussianSplatsVarPro
 from .oneshot_demo import OneShotGaussianImage
+from .sparse_splat import SparseSplatImage
 
 __all__ = [
     "GaussianSplats",
@@ -30,5 +31,6 @@ __all__ = [
     "GaussianSplatsAdditive",
     "GaussianSplatsVarPro",
     "OneShotGaussianImage",
+    "SparseSplatImage",
     "cuda_rasterizer_available",
 ]
