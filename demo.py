@@ -9,6 +9,7 @@ Three fitting modes are available:
     default     — naive Adam optimisation (``GaussianSplats``).
     --fast-init — initialize with Fast-2DGS pretrained networks, then Adam.
     --em        — closed-form EM / weighted k-means (+ optional Adam polish).
+    --varpro    — Variable Projection on PoU basis; colors solved analytically.
 
 Examples
 --------
@@ -16,6 +17,7 @@ Examples
     python3 demo.py data/gauss.jpeg --n-gaussians 1500 --n-iters 300
     python3 demo.py --em --em-polish-iters 50
     python3 demo.py --fast-init --n-gaussians 600
+    python3 demo.py --varpro --n-iters 20 --em-polish-iters 100
 """
 
 from __future__ import annotations
@@ -32,7 +34,11 @@ from PIL import Image
 from splats import (
     FastInitGaussianSplats,
     GaussianSplats,
+    GaussianSplatsAdditive,
     GaussianSplatsEM,
+    GaussianSplatsOnline,
+    GaussianSplatsVarPro,
+    OneShotGaussianImage,
     cuda_rasterizer_available,
 )
 
@@ -132,6 +138,17 @@ def main() -> None:
         help="initialize Gaussians with Fast-2DGS pretrained networks (Fast-2DGS submodule).",
     )
     p.add_argument(
+        "--additive",
+        action="store_true",
+        help="fit unnormalized additive model Î(x)=Σ c_k G_k(x), colors unconstrained.",
+    )
+    p.add_argument(
+        "--additive-lam",
+        type=float,
+        default=1e-4,
+        help="Tikhonov λ added to Gram diagonal for the exact color solve.",
+    )
+    p.add_argument(
         "--em",
         action="store_true",
         help="fit with closed-form EM / weighted k-means (then optional Adam polish).",
@@ -154,6 +171,51 @@ def main() -> None:
         "--em-polish-iters", type=int, default=200, help="post-EM Adam polish steps."
     )
     p.add_argument("--em-polish-lr", type=float, default=0.01)
+    p.add_argument(
+        "--online",
+        action="store_true",
+        help="fit with EM init + patch-based Adam (GaussianSplatsOnline).",
+    )
+    p.add_argument(
+        "--online-patch-size", type=int, default=32,
+        help="patch side length (pixels) for the online Adam loop.",
+    )
+    p.add_argument(
+        "--online-em-init-iters", type=int, default=10,
+        help="closed-form EM warm-up steps before patch Adam.",
+    )
+    p.add_argument(
+        "--online-log-every", type=int, default=50,
+        help="full-image PSNR refresh interval during online Adam.",
+    )
+    p.add_argument(
+        "--online-polish-iters", type=int, default=0,
+        help="full-image Adam polish steps after the patch loop (0 to skip).",
+    )
+    p.add_argument("--online-polish-lr", type=float, default=0.01)
+    p.add_argument(
+        "--varpro",
+        action="store_true",
+        help="fit with Variable Projection on PoU basis (colors solved analytically each step).",
+    )
+    p.add_argument(
+        "--varpro-ridge",
+        type=float,
+        default=1e-6,
+        help="ridge regularization added to the Gram matrix in the VarPro color solve.",
+    )
+    p.add_argument(
+        "--oneshot",
+        action="store_true",
+        help="fit with the deterministic NumPy one-shot model (splats/oneshot.py, CPU).",
+    )
+    p.add_argument(
+        "--oneshot-adam",
+        type=int,
+        default=0,
+        help="post one-shot, run N torch Adam steps on GPU/MPS (exact one-shot model).",
+    )
+    p.add_argument("--oneshot-adam-lr", type=float, default=0.2)
     p.add_argument("--out", type=str, default="demo_out.png")
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
@@ -176,8 +238,38 @@ def main() -> None:
             fixed_opacity=args.fixed_opacity,
             local_render=args.local_render,
         ).to(device)
+    elif args.additive:
+        model = GaussianSplatsAdditive(
+            n_gaussians=args.n_gaussians,
+            n_channels=img.shape[0],
+            local_render=args.local_render,
+        ).to(device)
+    elif args.online:
+        model = GaussianSplatsOnline(
+            n_gaussians=args.n_gaussians,
+            n_channels=img.shape[0],
+            learn_opacity=args.learn_opacity,
+            fixed_opacity=args.fixed_opacity,
+            local_render=args.local_render,
+        ).to(device)
     elif args.em:
         model = GaussianSplatsEM(
+            n_gaussians=args.n_gaussians,
+            n_channels=img.shape[0],
+            learn_opacity=args.learn_opacity,
+            fixed_opacity=args.fixed_opacity,
+            local_render=args.local_render,
+        ).to(device)
+    elif args.varpro:
+        model = GaussianSplatsVarPro(
+            n_gaussians=args.n_gaussians,
+            n_channels=img.shape[0],
+            learn_opacity=args.learn_opacity,
+            fixed_opacity=args.fixed_opacity,
+            local_render=args.local_render,
+        ).to(device)
+    elif args.oneshot:
+        model = OneShotGaussianImage(
             n_gaussians=args.n_gaussians,
             n_channels=img.shape[0],
             learn_opacity=args.learn_opacity,
@@ -197,10 +289,30 @@ def main() -> None:
         f"[demo] {args.n_gaussians} gaussians | "
         f"learn_opacity={model.learn_opacity} | "
         f"fast_init={args.fast_init} | em={args.em} | "
-        f"n_iters={args.n_iters}"
+        f"additive={args.additive} | varpro={args.varpro} | "
+        f"oneshot={args.oneshot} | n_iters={args.n_iters}"
     )
 
-    if args.em:
+    if args.additive:
+        assert isinstance(model, GaussianSplatsAdditive)
+        model.fit(img, n_iters=args.n_iters, lr=args.lr, lam=args.additive_lam)
+    elif args.online:
+        assert isinstance(model, GaussianSplatsOnline)
+        model.fit(
+            img,
+            n_iters=args.n_iters,
+            lr=args.lr,
+            patch_size=args.online_patch_size,
+            em_init_iters=args.online_em_init_iters,
+            em_sigma_min=args.em_sigma_min,
+            em_sigma_max=args.em_sigma_max,
+            em_lam=args.em_lambda,
+            em_reseed_every=args.em_reseed_every,
+            log_every=args.online_log_every,
+            polish_iters=args.online_polish_iters,
+            polish_lr=args.online_polish_lr,
+        )
+    elif args.em:
         model.fit(  # type: ignore[union-attr]
             img,
             n_iters=args.n_iters,
@@ -211,6 +323,23 @@ def main() -> None:
             polish_iters=args.em_polish_iters,
             polish_lr=args.em_polish_lr,
         )
+    elif args.varpro:
+        assert isinstance(model, GaussianSplatsVarPro)
+        model.fit(
+            img,
+            n_iters=args.n_iters,
+            sigma_min=args.em_sigma_min,
+            sigma_max=args.em_sigma_max,
+            lam=args.em_lambda,
+            ridge=args.varpro_ridge,
+            reseed_every=args.em_reseed_every,
+            polish_iters=args.em_polish_iters,
+            polish_lr=args.em_polish_lr,
+        )
+    elif args.oneshot:
+        assert isinstance(model, OneShotGaussianImage)
+        model.fit(img, n_iters=args.n_iters)
+        model.refine_adam(args.oneshot_adam, lr=args.oneshot_adam_lr)
     else:
         model.fit(img, n_iters=args.n_iters, lr=args.lr)
 

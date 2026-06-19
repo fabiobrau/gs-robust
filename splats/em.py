@@ -4,7 +4,7 @@ Setting ``∇L = 0`` for the soft-blended reconstruction loss yields a coupled
 fixed-point system whose updates have the structure of weighted k-means. The
 closed-form M-step is::
 
-    (W Wᵀ) C = W Iᵀ,  with W_{k,x} = w_k(x)             (color, exact LS)
+    c_k ← Σ_x w_k(x) I(x)     / Σ_x w_k(x)              (color)
     μ_k ← Σ_x ρ_k(x) x        / Σ_x ρ_k(x)              (position)
     Σ_k ← Σ_x ρ_k(x) d_k d_kᵀ / Σ_x ρ_k(x)  + λI        (covariance)
 
@@ -161,19 +161,12 @@ class GaussianSplatsEM(GaussianSplats):
         rho_k = w_k * (r_dot_ck - r_dot_I.unsqueeze(0))                     # (G,H,W)
         del r_dot_ck
 
-        # ---------- M-step: color (exact normal-equation solve) ----------
-        # Î(x) = Σ_k w_k(x) c_k  ⇒  least-squares optimum given w_k is
-        # (W Wᵀ) C = W Iᵀ, with W ∈ ℝ^(G×HW), I ∈ ℝ^(C×HW).
-        G = self.n_gaussians
-        w_flat = w_k.reshape(G, -1)                                         # (G, HW)
-        w_sum = w_flat.sum(dim=1)                                           # (G,)
-        gram = w_flat @ w_flat.t()                                          # (G, G) SPD
-        rhs = w_flat @ img.reshape(C, -1).t()                               # (G, C)
-        # Scale-aware ridge: handles dead splats (diag≈0) and near-collinear rows.
-        ridge = 1e-6 * gram.diagonal().max().clamp(min=1.0)
-        gram.diagonal().add_(ridge)
-        new_colors = torch.linalg.solve(gram, rhs).clamp(1e-6, 1.0 - 1e-6)
-        del w_k, w_flat, gram, rhs
+        # ---------- M-step: color ----------
+        w_sum = w_k.sum(dim=(1, 2))                                         # (G,)
+        col_num = torch.einsum("ghw,chw->gc", w_k, img)                     # (G,C)
+        # Optimal colors in [0,1]; store as logits for sigmoid consistency
+        new_colors = (col_num / (w_sum.unsqueeze(1) + eps)).clamp(1e-6, 1.0 - 1e-6)
+        del w_k
 
         # ---------- M-step: position ----------
         rho_sum = rho_k.sum(dim=(1, 2))
